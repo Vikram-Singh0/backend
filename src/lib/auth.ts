@@ -22,9 +22,9 @@ export const auth = betterAuth({
   trustedOrigins: FRONTEND_URLS,
   advanced: {
     defaultCookieAttributes: {
-      secure: true,
+      secure: process.env.NODE_ENV === "production", // true for prod, false for dev
       httpOnly: true,
-      sameSite: "none", // Allows CORS-based cookie sharing across subdomains
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
     },
   },
   session: {

@@ -63,11 +63,8 @@ export const getBalances = async (req: Request, res: Response) => {
       },
     });
 
-    console.log("cumulatedBalances", cumulatedBalances);
-
-    const youOwe: Array<{ currency: string; amount: number }> = [];
-    const youGet: Array<{ currency: string; amount: number }> = [];
-
+    const youOwe: any[] = [];
+    const youGet: any[] = [];
     for (const b of cumulatedBalances) {
       const sumAmount = b._sum.amount;
       if (sumAmount && sumAmount > 0) {
@@ -79,8 +76,7 @@ export const getBalances = async (req: Request, res: Response) => {
 
     res.json({ cumulatedBalances, youOwe, youGet });
   } catch (error) {
-    console.error("Get balances error:", error);
-    res.status(500).json({ error: "Failed to fetch balances" });
+    res.status(500).json({ error: "Failed to get balances" });
   }
 };
 

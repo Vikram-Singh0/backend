@@ -10,6 +10,7 @@ import {
   getTransactionDetails,
   checkAccountExists,
 } from "../utils/stellar";
+import { logger } from "../utils/logger";
 
 const settleDebtSchemaCreate = z.object({
   groupId: z.string().min(1, "Group id is required"),
@@ -24,9 +25,14 @@ export const settleDebtCreateTransaction = async (
   req: Request,
   res: Response
 ) => {
+  logger.info({ body: req.body, userId: req.user?.id }, "[settleDebtCreateTransaction] called");
+  logger.info({ secretKey: process.env.SECRET_KEY ? `****${process.env.SECRET_KEY.slice(-4)}` : 'undefined' }, "[settleDebtCreateTransaction] env.SECRET_KEY");
+  logger.info({ headers: req.headers }, "[settleDebtCreateTransaction] Request headers");
+  
   const result = settleDebtSchemaCreate.safeParse(req.body);
 
   if (!result.success) {
+    logger.warn({ issues: result.error.issues }, "[settleDebtCreateTransaction] invalid input");
     res.status(400).json({ error: result.error.issues });
     return;
   }
@@ -34,16 +40,35 @@ export const settleDebtCreateTransaction = async (
   const { groupId, address, settleWithId, selectedTokenId, selectedChainId, expenseId } =
     { ...result.data, ...req.body };
 
+  logger.info({ groupId, address, settleWithId, selectedTokenId, selectedChainId, expenseId }, "[settleDebtCreateTransaction] Parsed data");
+
   const userId = req.user!.id;
 
   try {
+    // Check if tokens are initialized in database
+    const tokenCount = await prisma.token.count();
+    logger.info({ tokenCount }, "[settleDebtCreateTransaction] Token count in database");
+    
+    if (tokenCount === 0) {
+      logger.warn("No tokens found in database, initializing...");
+      // Import and call initialization function
+      const { initializeMultiChainSystem, initializeChainsAndTokens } = await import("../services/initialize-multichain");
+      await initializeMultiChainSystem();
+      await initializeChainsAndTokens();
+      logger.info("Tokens initialized in database");
+    }
+
+    logger.info({ address }, "[settleDebtCreateTransaction] Checking account existence");
     const accountExists = await checkAccountExists(address);
+    logger.info({ address, accountExists }, "[settleDebtCreateTransaction] Account existence result");
 
     if (!accountExists) {
+      logger.warn({ address }, "[settleDebtCreateTransaction] Account does not exist");
       res.status(400).json({ error: "Account does not exist" });
       return;
     }
 
+    logger.info({ userId, groupId, settleWithId }, "[settleDebtCreateTransaction] Fetching group balances");
     const balances = await prisma.groupBalance.findMany({
       where: {
         AND: [
@@ -55,18 +80,24 @@ export const settleDebtCreateTransaction = async (
       include: {
         friend: {
           select: {
-            stellarAccount: true,
+            id: true,
             name: true,
+            stellarAccount: true,
+            chainAccounts: {
+              where: { chainId: 'stellar' },
+              select: { address: true }
+            }
           },
         },
       },
     });
-
-    console.log("balances", balances);
+    logger.info({ balances }, "[settleDebtCreateTransaction] Group balances fetched");
 
     const toPay = balances.filter((balance) => balance.amount > 0);
+    logger.info({ toPay }, "[settleDebtCreateTransaction] Filtered balances to pay");
 
     if (toPay.length === 0) {
+      logger.warn({ userId, groupId }, "[settleDebtCreateTransaction] No balances to pay");
       res.status(400).json({ error: "No balances to pay" });
       return;
     }
@@ -82,6 +113,7 @@ export const settleDebtCreateTransaction = async (
         where: { id: expenseId },
         select: { acceptedTokenIds: true }
       });
+      logger.info({ expense }, "[settleDebtCreateTransaction] Expense-level resolver");
       if (expense && expense.acceptedTokenIds && expense.acceptedTokenIds.length > 0) {
         allowedTokenIds = expense.acceptedTokenIds;
         resolverLevel = "expense";
@@ -94,6 +126,7 @@ export const settleDebtCreateTransaction = async (
         where: { groupId },
         select: { tokenId: true, chainId: true }
       });
+      logger.info({ groupTokens }, "[settleDebtCreateTransaction] Group-level resolver");
       if (groupTokens.length > 0) {
         allowedTokenIds = groupTokens.map(t => t.tokenId);
         allowedChainIds = groupTokens.map(t => t.chainId);
@@ -107,6 +140,7 @@ export const settleDebtCreateTransaction = async (
         where: { userId: settleWithId },
         select: { tokenId: true, chainId: true }
       });
+      logger.info({ userTokens }, "[settleDebtCreateTransaction] User-level resolver");
       if (userTokens.length > 0) {
         allowedTokenIds = userTokens.map(t => t.tokenId);
         allowedChainIds = userTokens.map(t => t.chainId);
@@ -117,12 +151,14 @@ export const settleDebtCreateTransaction = async (
     // If a resolver is set, enforce it
     if (allowedTokenIds.length > 0) {
       if (!selectedTokenId || !allowedTokenIds.includes(selectedTokenId)) {
+        logger.warn({ selectedTokenId, allowedTokenIds, resolverLevel }, "[settleDebtCreateTransaction] Resolver enforcement failed (token)");
         return res.status(400).json({
           error: `You must settle using the allowed resolver token(s) (${resolverLevel} level). Allowed token IDs: ${allowedTokenIds.join(", ")}`
         });
       }
       // Optionally, also check chainId if needed
       if (allowedChainIds.length > 0 && selectedChainId && !allowedChainIds.includes(selectedChainId)) {
+        logger.warn({ selectedChainId, allowedChainIds, resolverLevel }, "[settleDebtCreateTransaction] Resolver enforcement failed (chain)");
         return res.status(400).json({
           error: `You must settle using the allowed resolver chain(s) (${resolverLevel} level). Allowed chain IDs: ${allowedChainIds.join(", ")}`
         });
@@ -136,17 +172,46 @@ export const settleDebtCreateTransaction = async (
 
     if (selectedTokenId && selectedChainId) {
       // Use selected token if provided
+      logger.info({ selectedTokenId, selectedChainId }, "[settleDebtCreateTransaction] Looking for selected token");
       settlementToken = await prisma.token.findUnique({
         where: { id: selectedTokenId },
         include: { chain: true },
       });
-
+      logger.info({ settlementToken }, "[settleDebtCreateTransaction] Selected token result");
       if (!settlementToken) {
-        res.status(404).json({ error: "Selected token not found" });
-        return;
+        logger.error({ selectedTokenId }, "[settleDebtCreateTransaction] Selected token not found");
+        // Let's also check what tokens exist for this chain
+        const availableTokens = await prisma.token.findMany({
+          where: { chainId: selectedChainId },
+          select: { id: true, symbol: true, name: true }
+        });
+        logger.info({ availableTokens, selectedChainId }, "[settleDebtCreateTransaction] Available tokens for chain");
+        
+        // For Stellar chain, try to find XLM token by symbol if ID not found
+        if (selectedChainId === "stellar" && selectedTokenId === "xlm") {
+          logger.info("Trying to find XLM token by symbol");
+          const xlmToken = await prisma.token.findFirst({
+            where: { 
+              chainId: "stellar",
+              symbol: "XLM"
+            },
+            include: { chain: true },
+          });
+          if (xlmToken) {
+            logger.info({ xlmToken }, "[settleDebtCreateTransaction] Found XLM token by symbol");
+            settlementToken = xlmToken;
+            settlementChain = xlmToken.chain;
+          } else {
+            res.status(404).json({ error: "Selected token not found" });
+            return;
+          }
+        } else {
+          res.status(404).json({ error: "Selected token not found" });
+          return;
+        }
+      } else {
+        settlementChain = settlementToken.chain;
       }
-
-      settlementChain = settlementToken.chain;
     } else {
       // Try to find a token accepted by all parties
       let acceptableTokens: any = [];
@@ -172,7 +237,7 @@ export const settleDebtCreateTransaction = async (
           where: { groupId },
           include: { token: true, chain: true },
         });
-
+        logger.info({ groupAcceptedTokens }, "[settleDebtCreateTransaction] Group accepted tokens");
         if (groupAcceptedTokens.length > 0) {
           acceptableTokens = groupAcceptedTokens.map((t) => ({
             token: t.token,
@@ -195,11 +260,10 @@ export const settleDebtCreateTransaction = async (
             symbol: "XLM",
           },
         });
-
+        logger.info({ stellarChain, xlmToken }, "[settleDebtCreateTransaction] Defaulting to XLM");
         if (!stellarChain || !xlmToken) {
-          res
-            .status(500)
-            .json({ error: "Default settlement token not configured" });
+          logger.error({}, "[settleDebtCreateTransaction] Default settlement token not configured");
+          res.status(500).json({ error: "Default settlement token not configured" });
           return;
         }
 
@@ -216,12 +280,19 @@ export const settleDebtCreateTransaction = async (
           settlementToken = acceptableTokens[0].token;
           settlementChain = acceptableTokens[0].chain;
         }
+        logger.info({ settlementToken, settlementChain }, "[settleDebtCreateTransaction] Using resolved token/chain");
       }
     }
 
     // Validate all friends have accounts on the selected chain
     for (const balance of toPay) {
-      if (!balance.friend.stellarAccount && settlementChain.id === "stellar") {
+      const friendStellarAddress =
+        balance.friend.chainAccounts && balance.friend.chainAccounts.length > 0
+          ? balance.friend.chainAccounts[0].address
+          : balance.friend.stellarAccount;
+      logger.info({ friendId: balance.friend.id, chainAccounts: balance.friend.chainAccounts, legacy: balance.friend.stellarAccount, using: friendStellarAddress }, "[settleDebtCreateTransaction] Checking friend account");
+      if (!friendStellarAddress && settlementChain.id === "stellar") {
+        logger.warn({ friendId: balance.friend.id }, "[settleDebtCreateTransaction] Missing Stellar account for friend");
         res.status(400).json({
           error: `Friend ${balance.friend.name} has no Stellar account`,
         });
@@ -236,8 +307,9 @@ export const settleDebtCreateTransaction = async (
             chainId: settlementChain.id,
           },
         });
-
+        logger.info({ friendId: balance.friend.id, friendChainAccount }, "[settleDebtCreateTransaction] Checking friend chain account");
         if (!friendChainAccount) {
+          logger.warn({ friendId: balance.friend.id, chainId: settlementChain.id }, "[settleDebtCreateTransaction] Missing chain account for friend");
           res.status(400).json({
             error: `Friend ${balance.friend.name} has no ${settlementChain.name} account`,
           });
@@ -250,28 +322,33 @@ export const settleDebtCreateTransaction = async (
       toPay.map(async (balance) => {
         let convertedAmount: string = "0";
         let tokenAmount: number = 0;
-
-        // Convert from USD or other currencies to settlement token
-        if (balance.currency === "USD" && settlementToken.symbol === "XLM") {
+        try {
+          if (balance.currency === "USD" && settlementToken.symbol === "XLM") {
           // Use existing conversion for USD to XLM
-          convertedAmount = await convertUsdToXLM(balance.amount);
-          tokenAmount = Number(convertedAmount);
-        } else if (balance.currency === "USD") {
+            convertedAmount = await convertUsdToXLM(balance.amount);
+            tokenAmount = Number(convertedAmount);
+          } else if (balance.currency === "USD") {
           // TODO: Implement conversion from USD to other tokens
           // For now, just use a 1:1 conversion
-          tokenAmount = balance.amount;
-          convertedAmount = balance.amount.toString();
-        } else {
+            tokenAmount = balance.amount;
+            convertedAmount = balance.amount.toString();
+          } else {
           // Same token, no conversion needed
-          tokenAmount = balance.amount;
-          convertedAmount = balance.amount.toString();
+            tokenAmount = balance.amount;
+            convertedAmount = balance.amount.toString();
+          }
+        } catch (err) {
+          logger.error({ err, balance }, "[settleDebtCreateTransaction] Error converting amount");
+          throw err;
         }
-
+        const friendStellarAddress =
+          balance.friend.chainAccounts && balance.friend.chainAccounts.length > 0
+            ? balance.friend.chainAccounts[0].address
+            : balance.friend.stellarAccount;
+        logger.info({ friendId: balance.friend.id, address: friendStellarAddress, amount: convertedAmount, tokenAmount }, "[settleDebtCreateTransaction] Payment resolved");
         return {
-          address: balance.friend.stellarAccount || "", // Will be replaced with chain-specific address
+          address: friendStellarAddress || "",
           amount: convertedAmount.toString(),
-          originalAmount: balance.amount,
-          originalCurrency: balance.currency,
           friendId: balance.firendId,
           tokenAmount: tokenAmount,
         };
@@ -288,7 +365,7 @@ export const settleDebtCreateTransaction = async (
             chainId: settlementChain.id,
           },
         });
-
+        logger.info({ friendId: payment.friendId, friendChainAccount }, "[settleDebtCreateTransaction] Non-stellar payment address resolved");
         if (friendChainAccount) {
           toPayInSettlementToken[i].address = friendChainAccount.address;
         }
@@ -299,11 +376,12 @@ export const settleDebtCreateTransaction = async (
       (acc, balance) => acc + Number(balance.tokenAmount),
       0
     );
+    logger.info({ totalAmount, toPayInSettlementToken }, "[settleDebtCreateTransaction] Total amount to pay");
 
     // Check if user has enough balance for settlement
+    logger.info({ address }, "[settleDebtCreateTransaction] Checking account balance");
     const accountBalance = await checkAccountBalance(address);
-
-    console.log("accountBalance", accountBalance);
+    logger.info({ accountBalance }, "[settleDebtCreateTransaction] Account balance fetched");
 
     // This is Stellar-specific, modify for other chains
     const tokenBalance =
@@ -312,61 +390,69 @@ export const settleDebtCreateTransaction = async (
             accountBalance.find((balance) => balance.asset_type === "native")
               ?.balance || 0
           )
-        : 0; // For other chains, implement balance checking
+        : 0;
+    logger.info({ tokenBalance }, "[settleDebtCreateTransaction] Token balance resolved");
 
     if (tokenBalance < totalAmount && settlementChain.id === "stellar") {
+      logger.warn({ tokenBalance, totalAmount }, "[settleDebtCreateTransaction] Insufficient balance");
       res.status(400).json({ error: "Insufficient balance" });
       return;
     }
 
     // Create transaction
     let transaction;
-
-    // For now, only implement Stellar transaction creation
-    if (settlementChain.id === "stellar") {
-      transaction = await createSerializedTransaction(
-        address,
-        toPayInSettlementToken.map((balance) => ({
-          address: balance.address,
-          amount: balance.amount,
-        }))
-      );
-    } else {
-      // TODO: Implement transaction creation for other chains
-      res
-        .status(400)
-        .json({ error: "Settlement on this chain not yet implemented" });
-      return;
+    try {
+      if (settlementChain.id === "stellar") {
+        logger.info({ address, payments: toPayInSettlementToken.map(b => ({ address: b.address, amount: b.amount })) }, "[settleDebtCreateTransaction] Creating serialized transaction");
+        transaction = await createSerializedTransaction(
+          address,
+          toPayInSettlementToken.map((balance) => ({
+            address: balance.address,
+            amount: balance.amount,
+          }))
+        );
+        logger.info({ transaction }, "[settleDebtCreateTransaction] Serialized transaction created");
+      } else {
+        logger.warn({ settlementChain }, "[settleDebtCreateTransaction] Settlement on this chain not yet implemented");
+        res
+          .status(400)
+          .json({ error: "Settlement on this chain not yet implemented" });
+        return;
+      }
+    } catch (err) {
+      logger.error({ err }, "[settleDebtCreateTransaction] Error creating transaction");
+      throw err;
     }
 
     // Store the transaction details in the database
-    const settlementTransaction = await prisma.settlementTransaction.create({
-      data: {
-        userId: userId,
-        groupId: groupId,
-        serializedTx: transaction.serializedTx,
-        settleWithId: settleWithId,
-        status: "PENDING",
-        chainId: settlementChain.id,
-        tokenId: settlementToken.id,
-        settlementItems: {
-          create: toPayInSettlementToken.map((item) => ({
-            userId: userId,
-            friendId: item.friendId,
-            originalAmount: item.originalAmount,
-            originalCurrency: item.originalCurrency,
-            xlmAmount: item.tokenAmount, // For backward compatibility
-            amount: item.tokenAmount,
-            currency: settlementToken.symbol,
-            friend: {
-              connect: {
-                id: item.friendId,
-              },
-            },
-          })),
+    let settlementTransaction;
+    try {
+      settlementTransaction = await prisma.settlementTransaction.create({
+        data: {
+          userId: userId,
+          groupId: groupId,
+          serializedTx: transaction.serializedTx,
+          settleWithId: settleWithId,
+          status: "PENDING",
+          chainId: settlementChain.id,
+          tokenId: settlementToken.id,
+          settlementItems: {
+            create: toPayInSettlementToken.map((item) => ({
+              userId: userId,
+              friendId: item.friendId,
+              amount: item.tokenAmount,
+              currency: settlementToken.symbol,
+            })),
+          },
         },
-      },
-    });
+      });
+      logger.info({ settlementTransaction }, "[settleDebtCreateTransaction] Settlement transaction stored in DB");
+    } catch (err) {
+      logger.error({ err }, "[settleDebtCreateTransaction] Error storing settlement transaction in DB");
+      throw err;
+    }
+
+    logger.info({ toPayInSettlementToken }, "[settleDebtCreateTransaction] success");
 
     res.json({
       serializedTx: transaction.serializedTx,
@@ -376,7 +462,7 @@ export const settleDebtCreateTransaction = async (
       chainName: settlementChain.name,
     });
   } catch (error) {
-    console.error("Create settlement transaction error:", error);
+    logger.error({ error, stack: (error as any)?.stack }, "[settleDebtCreateTransaction] Unhandled error");
     res.status(500).json({ error: "Failed to create settlement transaction" });
   }
 };
@@ -417,7 +503,12 @@ export const settleDebtSubmitTransaction = async (
           include: {
             friend: {
               select: {
+                id: true,
                 stellarAccount: true,
+                chainAccounts: {
+                  where: { chainId: 'stellar' },
+                  select: { address: true }
+                }
               },
             },
           },
@@ -448,9 +539,16 @@ export const settleDebtSubmitTransaction = async (
 
       // Find the matching settlement item
       const matchingItem = settlementTransaction.settlementItems.find(
-        (item) =>
-          item.friend.stellarAccount === recipient &&
+        (item) => {
+          const friendStellarAddress =
+            item.friend.chainAccounts && item.friend.chainAccounts.length > 0
+              ? item.friend.chainAccounts[0].address
+              : item.friend.stellarAccount;
+          return (
+            friendStellarAddress === recipient &&
           Math.abs(item.amount - amount) < 0.00001 // Account for floating point precision
+          );
+        }
       );
 
       if (!matchingItem) {

@@ -28,11 +28,11 @@ export const createReminder = async (senderId: string, reminderData: any) => {
     let userReminderAmount = undefined;
     // For USER type reminders, check if there's any balance
     if (reminderType === ReminderType.USER) {
-      // FIX: Check if sender owes any money to receiver
+      // FIX: Check if receiver owes any money to sender
       const balance = await prisma.balance.findFirst({
         where: {
-          userId: receiverId, // receiver is owed
-          friendId: senderId, // sender owes
+          userId: receiverId, // receiver is the one who owes
+          friendId: senderId, // sender is the one requesting
           amount: {
             gt: 0
           }
@@ -187,8 +187,8 @@ export const getRemindersForUser = async (receiverId: string) => {
       if (reminder.reminderType === ReminderType.USER) {
         const balance = await prisma.balance.findFirst({
           where: {
-            userId: reminder.senderId,
-            friendId: reminder.receiverId,
+            userId: reminder.receiverId, // receiver is the one who owes
+            friendId: reminder.senderId, // sender is the one requesting
             amount: {
               gt: 0
             }
