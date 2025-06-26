@@ -437,12 +437,28 @@ export const settleDebtCreateTransaction = async (
           chainId: settlementChain.id,
           tokenId: settlementToken.id,
           settlementItems: {
-            create: toPayInSettlementToken.map((item) => ({
-              userId: userId,
-              friendId: item.friendId,
-              amount: item.tokenAmount,
-              currency: settlementToken.symbol,
-            })),
+            create: toPayInSettlementToken.map((item) => {
+              // Find the original balance to get the original debt amount
+              const originalBalance = toPay.find(b => b.firendId === item.friendId);
+              const originalAmount = originalBalance?.amount || item.tokenAmount;
+              
+              logger.info({ 
+                friendId: item.friendId, 
+                originalAmount: originalAmount,
+                convertedAmount: item.tokenAmount,
+                originalCurrency: originalBalance?.currency || "USD"
+              }, "[settleDebtCreateTransaction] Storing settlement item with original amount");
+
+              return {
+                userId: userId,
+                friendId: item.friendId,
+                amount: item.tokenAmount, // Store converted amount for transaction
+                currency: settlementToken.symbol, // Store settlement currency
+                // Store original debt information for balance updates
+                afterSettlementBalance: originalAmount, // Store original debt amount
+                groupId: groupId, // Store group context
+              };
+            }),
           },
         },
       });
@@ -603,13 +619,50 @@ export const settleDebtSubmitTransaction = async (
     });
 
     // Update group balances based on the settlement items
-    const participants = settlementTransaction.settlementItems.map((item) => ({
-      userId: item.friendId,
-      amount: item.amount,
-      currency: item.currency,
-    }));
+    // IMPORTANT: We need to use the original debt amounts, not the converted settlement amounts
+    // The settlement amounts are in XLM, but the original debts are in USD
+    const participants = settlementTransaction.settlementItems.map((item) => {
+      // Use the stored original debt amount from afterSettlementBalance
+      const originalAmount = item.afterSettlementBalance || item.amount;
+      
+      logger.info({ 
+        friendId: item.friendId, 
+        settlementAmount: item.amount, 
+        settlementCurrency: item.currency,
+        originalAmount: originalAmount,
+        originalCurrency: "USD"
+      }, "[settleDebtSubmitTransaction] Balance resolution using stored original amount");
 
-    await updateGroupBalanceForParticipants(participants, userId, groupId);
+      return {
+        userId: item.friendId,
+        amount: Math.abs(originalAmount), // Use original debt amount, ensure positive
+        currency: "USD", // Always use USD for balance updates
+      };
+    });
+
+    logger.info({ 
+      userId, 
+      groupId, 
+      participants, 
+      settlementId: settlementTransaction.id 
+    }, "[settleDebtSubmitTransaction] Updating group balances with original amounts");
+
+    try {
+      await updateGroupBalanceForParticipants(participants, userId, groupId);
+      logger.info({ 
+        userId, 
+        groupId, 
+        settlementId: settlementTransaction.id 
+      }, "[settleDebtSubmitTransaction] Group balances updated successfully");
+    } catch (error) {
+      logger.error({ 
+        error, 
+        userId, 
+        groupId, 
+        settlementId: settlementTransaction.id 
+      }, "[settleDebtSubmitTransaction] Error updating group balances");
+      throw error;
+    }
 
     res.json({
       hash: submitTransactionResponse.hash,

@@ -21,88 +21,71 @@ export const getAnalyticsController = async (req: Request, res: Response) => {
     endOfMonth.setDate(0);
     endOfMonth.setHours(23, 59, 59, 999);
 
-    // Get all expenses where user is involved
-    const expenses = await prisma.expense.findMany({
+    // Calculate current balances (what user owes and is owed)
+    // Get individual balances where user owes money (positive amounts)
+    const individualOwed = await prisma.balance.aggregate({
+      _sum: { amount: true },
       where: {
-        OR: [
-          { paidBy: userId }, // User paid
-          {
-            expenseParticipants: {
-              some: {
-                userId: userId
-              }
-            }
-          }
-        ],
-        createdAt: {
-          gte: startOfMonth,
-          lte: endOfMonth
-        }
+        userId: userId,
+        amount: { gt: 0 },
       },
-      include: {
-        expenseParticipants: true,
-        paidByUser: {
-          select: {
-            id: true,
-            name: true
-          }
-        }
-      }
     });
 
-    let totalOwed = new Decimal(0);
-    let totalLent = new Decimal(0);
-
-    expenses.forEach((expense) => {
-      const userParticipant = expense.expenseParticipants.find(
-        participant => participant.userId === userId
-      );
-      
-      if (expense.paidBy === userId) {
-        // User paid for the expense
-        const totalAmount = expense.expenseParticipants.reduce(
-          (sum: Decimal, participant: ExpenseParticipant) => 
-            sum.plus(new Decimal(participant.amount.toString())), 
-          new Decimal(0)
-        );
-        const userAmount = userParticipant ? new Decimal(userParticipant.amount.toString()) : new Decimal(0);
-        totalLent = totalLent.plus(totalAmount.minus(userAmount)); // Amount lent to others
-      } else if (userParticipant) {
-        // Someone else paid, and user was part of the split
-        totalOwed = totalOwed.plus(new Decimal(userParticipant.amount.toString()));
-      }
+    // Get individual balances where user is owed money (negative amounts)
+    const individualLent = await prisma.balance.aggregate({
+      _sum: { amount: true },
+      where: {
+        userId: userId,
+        amount: { lt: 0 },
+      },
     });
 
-    // Get settlements made by user this month
-    const settlements = await prisma.settlementItem.findMany({
+    // Calculate total owed (positive balances) - only from Balance table
+    const totalOwed = individualOwed._sum?.amount || 0;
+    const owed = totalOwed.toFixed(2);
+
+    // Calculate total lent (negative balances) - only from Balance table
+    const totalLent = Math.abs(individualLent._sum?.amount || 0);
+    const lent = totalLent.toFixed(2);
+
+    // Get settlements for this month - use the original debt amounts (afterSettlementBalance)
+    const settlementsThisMonth = await prisma.settlementItem.findMany({
       where: {
         OR: [
           { userId: userId },
           { friendId: userId }
         ],
-        createdAt: {
-          gte: startOfMonth,
-          lte: endOfMonth
+        settlementTransaction: {
+          status: "COMPLETED",
+          completedAt: {
+            gte: startOfMonth,
+            lte: endOfMonth
+          }
         }
+      },
+      include: {
+        settlementTransaction: true
       }
     });
 
     let totalSettled = new Decimal(0);
-    settlements.forEach((settlement) => {
-      if (settlement.userId === userId) {
-        totalSettled = totalSettled.plus(new Decimal(settlement.amount.toString()));
-      }
+    settlementsThisMonth.forEach((settlement) => {
+      // Use the original debt amount (afterSettlementBalance) if available, otherwise use the settlement amount
+      const settlementAmount = settlement.afterSettlementBalance || settlement.amount;
+      totalSettled = totalSettled.plus(new Decimal(settlementAmount.toString()));
     });
 
+    const settled = totalSettled.toFixed(2);
+
     logger.info(
-      { userId, totalOwed, totalLent, totalSettled },
+      { userId, totalOwed: owed, totalLent: lent, totalSettled: settled },
       "Successfully retrieved analytics data"
     );
 
     res.status(200).json({
-      owed: `$${totalOwed.toFixed(2)} USD`,
-      lent: `$${totalLent.toFixed(2)} USD`,
-      settled: `$${totalSettled.toFixed(2)} USD`
+      owed: `$${owed} USD`,
+      lent: `$${lent} USD`,
+      settled: `$${settled} USD`
     });
   } catch (error) {
     logger.error({ error, userId: req.user?.id }, "Failed to get analytics data");
